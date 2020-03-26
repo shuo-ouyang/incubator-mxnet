@@ -32,10 +32,105 @@ namespace mxnet {
 namespace kvstore {
 
 // these gpu functions are defined in gradient_compression.cu
+void Quantize1BitImpl(mshadow::Stream<mshadow::gpu> *s, const std::vector<mxnet::TBlob> &inputs,
+                      const float threshold);
+void Dequantize1BitImpl(mshadow::Stream<mshadow::gpu> *s, const std::vector<mxnet::TBlob> &inputs,
+                        const float threshold);
 void Quantize2BitImpl(mshadow::Stream<mshadow::gpu> *s, const std::vector<mxnet::TBlob> &inputs,
                       const float threshold);
 void Dequantize2BitImpl(mshadow::Stream<mshadow::gpu> *s, const std::vector<mxnet::TBlob> &inputs,
                         const float threshold);
+
+struct quantize_1bit {
+  MSHADOW_XINLINE static void Map(int out_block_id,
+                                  int original_size,
+                                  float *out,
+                                  float *grad,
+                                  float *residual,
+                                  const float threshold) {
+    // this block contains the compressed representation of
+    // upto 32 values starting from out_block_id*32
+    float *compr_block = out + out_block_id;
+    // init to 0
+    *compr_block = 0;
+    // start and end are indices in original grad array
+    const int start = out_block_id << 5;
+    const int end = (start + 32 <= original_size) ? start + 32 : original_size;
+
+    char *block_ptr = reinterpret_cast < char * > (compr_block);
+    // masks used to quantize data
+    const uint8_t bits[] = {0x80, 0x40, 0x20, 0x10, 0x08, 0x04, 0x02, 0x01};
+    for (int i = start; i < end; ++i) {
+      // adds offset to reach appropriate byte
+      char *curr_byte = block_ptr + ((i - start) >> 3);
+      // adds gradient to existing residual to get updated grad
+      residual[i] += grad[i];
+      if (residual[i] > threshold) {
+        // set data to 1
+        *curr_byte |= bits[(i & 7)];
+        // reduce residual by 1
+        residual[i] -= 1;
+      } else {
+        // set data to 0
+        *curr_byte &= ~bits[(i & 7)];
+        // add residual by 1
+        // because current position will be dequantized to -1
+        residual[i] += 1;
+      }
+    }
+  }
+};
+
+template<typename xpu>
+void Quantize1BitKernelLaunch(mshadow::Stream<xpu> *s, const std::vector<mxnet::TBlob> &inputs,
+                              const float threshold) {
+  mxnet::op::mxnet_op::Kernel<quantize_1bit, xpu>
+    ::Launch(s,
+            inputs[2].Size(),         // compressed array size
+            inputs[0].Size(),         // original size
+            inputs[2].dptr<float>(),  // compressed array
+            inputs[0].dptr<float>(),  // original array
+            inputs[1].dptr<float>(),  // residual array
+            threshold);               // threshold
+}
+
+struct dequantize_1bit {
+  MSHADOW_XINLINE static void Map(int i,
+                                  float *out,
+                                  float *in,
+                                  const float threshold) {
+    // get position of dequantized value to fill
+    float *outval = out + i;
+    // gets byte which holds quantized value for this position
+    char *ch_ptr = reinterpret_cast < char * > (in + (i >> 5));
+    ch_ptr += ((i & 31) >> 3);
+    // masks used to quantize data
+    const uint8_t bits[] = {0x80, 0x40, 0x20, 0x10, 0x08, 0x04, 0x02, 0x01};
+    // col denotes which bit of a byte is set for this value
+    // col=0 implies the first bit, col=1 implies the second bit,...
+    const int col = i & 7;
+    const uint8_t mask = bits[col];
+    const uint8_t masked = *ch_ptr & mask;
+    if (masked == mask) {
+      *outval = +1;
+    } else {
+      // if current position of byte is 0
+      // dequantized it to -1
+      *outval = -1;
+    }
+  }
+};
+
+template<typename xpu>
+void Dequantize1BitKernelLaunch(mshadow::Stream<xpu> *s, const std::vector<mxnet::TBlob> &inputs,
+                                const float threshold) {
+  mxnet::op::mxnet_op::Kernel<dequantize_1bit, xpu>
+  ::Launch(s,
+          inputs[1].Size(),         // original size
+          inputs[1].dptr<float>(),  // out array
+          inputs[0].dptr<float>(),  // compressed array
+          threshold);               // threshold
+}
 
 struct quantize_2bit {
   MSHADOW_XINLINE static void Map(int out_block_id,
@@ -136,6 +231,18 @@ void Dequantize2BitKernelLaunch(mshadow::Stream<xpu> *s, const std::vector<mxnet
           inputs[0].dptr<float>(),  // compressed array
           -1 *threshold,            // negative threshold
           threshold);               // positive threshold
+}
+
+inline void Quantize1BitImpl(mshadow::Stream<mshadow::cpu> *s,
+                             const std::vector<mxnet::TBlob> &inputs,
+                             const float threshold) {
+  Quantize1BitKernelLaunch(s, inputs, threshold);
+}
+
+inline void Dequantize1BitImpl(mshadow::Stream<mshadow::cpu> *s,
+                               const std::vector<mxnet::TBlob> &inputs,
+                               const float threshold) {
+  Dequantize1BitKernelLaunch(s, inputs, threshold);
 }
 
 inline void Quantize2BitImpl(mshadow::Stream<mshadow::cpu> *s,
