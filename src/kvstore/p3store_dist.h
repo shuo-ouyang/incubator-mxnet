@@ -61,8 +61,7 @@ class P3StoreDist : public KVStoreDist {
           << "Please set MXNET_UPDATE_ON_KVSTORE to false.";
   }
 
-  void SetGradientCompression(const std::vector<std::pair<std::string, std::string>>
-                              & kwargs) final {
+  void SetGradientCompression(const std::string& name, const kvstore::compressor::kwarg_t& kwargs) final {
     LOG(FATAL) << "NotImplementedError: Gradient compression not supported in P3StoreDist.";
   }
 
@@ -123,8 +122,7 @@ class P3StoreDist : public KVStoreDist {
   }
 
   void PullDefault(int key, const NDArray &recv_buf, int priority) override {
-    CHECK(gradient_compression_->get_type() == CompressionType::kNone)
-       << "Gradient compression not supported in P3StoreDist.";
+    CHECK(compr_->IsInitialized()) << "Gradient compression not supported in P3StoreDist.";
     auto pull_from_servers = [this, key, recv_buf, priority](
         RunContext rctx, Engine::CallbackOnComplete cb) {
       // convert to ps keys
@@ -169,8 +167,7 @@ class P3StoreDist : public KVStoreDist {
   }
 
   void PushPullDefault(int key, const NDArray &comm_buf, int priority) override {
-    CHECK(gradient_compression_->get_type() == CompressionType::kNone)
-             << "Compression not supported in P3StoreDist";
+    CHECK(compr_->IsInitialized()) << "Compression not supported in P3StoreDist";
     auto pushpull = [this, key, comm_buf, priority](
         RunContext rctx, Engine::CallbackOnComplete cb) {
       size_t size = comm_buf.shape().Size();

@@ -38,7 +38,7 @@
 #include <tuple>
 #include "./comm.h"
 #include "./kvstore_local.h"
-#include "../common/cuda/utils.h"
+#include "../common/cuda_utils.h"
 
 // NCCL v2 introduces NCCL_MAJOR macro for versioning,
 // so if there is no such macro defined in nccl.h
@@ -180,8 +180,7 @@ class KVStoreNCCL : public KVStoreLocal {
     LOG(FATAL) << "NCCL kvstore does not support sparse storage type";
   }
 
-  void SetGradientCompression(const std::vector<std::pair<std::string, std::string> >
-                                      & kwargs) override {
+  void SetGradientCompression(const std::string& name, const kvstore::compressor::kwarg_t& kwargs) override {
     LOG(FATAL) << "NCCL kvstore does not support gradient compression";
   }
 

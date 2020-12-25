@@ -18,23 +18,21 @@
  */
 
 /*!
- * \file gradient_compression.cu
- * \author Rahul Huilgol
- * \brief Implementation for gpu version of code
+ * \file onebit-inl.h
+ * \brief One bit compressor for kvstore.
+ * \author Shuo Ouyang
  */
 
-#include "gradient_compression-inl.h"
+#include "error_feedback-inl.h"
 
 namespace mxnet {
 namespace kvstore {
-void Quantize2BitImpl(mshadow::Stream<gpu>* s, const std::vector<TBlob>& inputs,
-                      const float threshold) {
-  Quantize2BitKernelLaunch(s, inputs, threshold);
+namespace compressor {
+void MomentumErrorFeedbackImpl(mshadow::Stream<mshadow::gpu> *s,
+                               const mxnet::TBlob &in, mxnet::TBlob &out,
+                               const float alpha) {
+  MomentumErrorFeedbackKernalLaunch(s, in, out, alpha);
 }
-
-void Dequantize2BitImpl(mshadow::Stream<gpu>* s, const std::vector<TBlob>& inputs,
-                        const float threshold) {
-  Dequantize2BitKernelLaunch(s, inputs, threshold);
-}
-}  // namespace kvstore
-}  // namespace mxnet
+} // namespace compressor
+} // namespace kvstore
+} // namespace mxnet

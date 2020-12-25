@@ -162,7 +162,7 @@ class KVStoreDistServer {
     ps_server_->set_request_handle(
         std::bind(&KVStoreDistServer::DataHandleEx, this, _1, _2, _3));
     sync_mode_ = false;
-    gradient_compression_ = std::make_shared<GradientCompression>();
+    compr_ = std::shared_ptr<kvstore::compressor::Compressor>();
     log_verbose_ = dmlc::GetEnv("MXNET_KVSTORE_DIST_ROW_SPARSE_VERBOSE", false);
   }
 
@@ -206,7 +206,7 @@ class KVStoreDistServer {
         sync_mode_ = true;
         break;
       case CommandType::kSetGradientCompression:
-        gradient_compression_->DecodeParams(recved.body);
+        compr_->Init(compr_->DecodeParams(recved.body));
         break;
       case CommandType::kSetProfilerParams:
         // last char is the type of profiler command
@@ -656,7 +656,7 @@ class KVStoreDistServer {
 
       if (stored.is_none()) {
         stored = NDArray(dshape, Context());
-        gradient_compression_->Dequantize(recved, &stored, 0);
+        compr_->DecompressEx(recved, &stored, 0);
         server->Response(req_meta);
         stored.WaitToRead();
       } else if (sync_mode_) {
@@ -666,16 +666,16 @@ class KVStoreDistServer {
           merged.merged = NDArray(dshape, Context());
         }
         if (merged.request.size() == 0) {
-          gradient_compression_->Dequantize(recved, &merged.merged, 0);
+          compr_->DecompressEx(recved, &merged.merged, 0);
         } else {
-          gradient_compression_->Dequantize(recved, &decomp_buf, 0);
+          compr_->DecompressEx(recved, &decomp_buf, 0);
           merged.merged += decomp_buf;
         }
         merged.request.push_back(req_meta);
         ApplyUpdates(type, key, req_data, &merged, server);
       } else {
         // async push
-        gradient_compression_->Dequantize(recved, &decomp_buf, 0);
+        compr_->DecompressEx(recved, &decomp_buf, 0);
         exec_.Exec([this, key, &decomp_buf, &stored]() {
           CHECK(updater_);
           updater_(key, decomp_buf, &stored);
@@ -812,7 +812,7 @@ class KVStoreDistServer {
    * starts with none, used after SetGradientCompression sets the type
    * currently there is no support for unsetting gradient compression
    */
-  std::shared_ptr<kvstore::GradientCompression> gradient_compression_;
+  std::shared_ptr<kvstore::compressor::Compressor> compr_;
 };
 
 }  // namespace kvstore

@@ -31,7 +31,7 @@
 #include <tuple>
 #include <thread>
 #include "mxnet/ndarray.h"
-#include "gradient_compression.h"
+#include "compressor/compressor.h"
 #include "../ndarray/ndarray_function.h"
 #include "../operator/tensor/sparse_retain-inl.h"
 #include "../profiler/profiler.h"
@@ -87,14 +87,14 @@ class Comm {
    * \brief Sets gradient compression parameters to be able to
    * perform reduce with compressed gradients
    */
-  void SetGradientCompression(std::shared_ptr<GradientCompression> gc) {
-    gc_ = gc;
+  void SetCompressor(std::shared_ptr<kvstore::compressor::Compressor> compr) {
+    local_compr_ = compr;
   }
 
  protected:
   Context pinned_ctx_;
 
-  std::shared_ptr<GradientCompression> gc_;
+  std::shared_ptr<kvstore::compressor::Compressor> local_compr_;
 };
 
 /**
@@ -505,7 +505,7 @@ class CommDevice : public Comm {
                         int priority) override {
     // when this reduce is called from kvstore_dist, gc is not set
     // we don't do compression twice in dist_sync_device
-    if ((gc_ != nullptr) && (gc_->get_type() != CompressionType::kNone)) {
+    if (local_compr_ != nullptr) {
       return ReduceCompressed(key, src, priority);
     }
 
@@ -574,7 +574,8 @@ class CommDevice : public Comm {
                                   false, buf.merged.dtype());
         buf.residual[i].AssignStorageInfo(profiler_scope, "residual");
         buf.residual[i] = 0;
-        int64_t small_size = gc_->GetCompressedSize(buf.merged.shape().Size());
+        
+        int64_t small_size = local_compr_->GetCompressedSize(buf.merged.shape().Size());
         buf.compressed_recv_buf[i] = NDArray(mxnet::TShape{small_size}, buf.merged.ctx(),
                                              false, buf.merged.dtype());
         buf.compressed_recv_buf[i].AssignStorageInfo(profiler_scope, "compressed_recv_buf");
@@ -588,7 +589,7 @@ class CommDevice : public Comm {
       // compress before copy
       // this is done even if the data is on same context as copy_buf because
       // we don't want the training to be biased towards data on this GPU
-      gc_->Quantize(src[i], &(buf.compressed_send_buf[i]), &(buf.residual[i]), priority);
+      local_compr_->CompressEx(src[i], &(buf.compressed_send_buf[i]), &(buf.residual[i]), priority);
 
       if (buf.compressed_send_buf[i].ctx() != buf.compressed_recv_buf[i].ctx()) {
         CopyFromTo(buf.compressed_send_buf[i], &(buf.compressed_recv_buf[i]), priority);
@@ -597,7 +598,7 @@ class CommDevice : public Comm {
         buf.compressed_recv_buf[i] = buf.compressed_send_buf[i];
       }
 
-      gc_->Dequantize(buf.compressed_recv_buf[i], &(buf.copy_buf[i]), priority);
+      local_compr_->DecompressEx(buf.compressed_recv_buf[i], &(buf.copy_buf[i]), priority);
       reduce[i] = buf.copy_buf[i];
     }
     ElementwiseSum(reduce, &buf.merged);

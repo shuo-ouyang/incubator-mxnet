@@ -23,6 +23,7 @@
  * \brief implement kv_store
  */
 #include <mxnet/kvstore.h>
+#include <stdlib.h>
 #include <dmlc/logging.h>
 #include "./kvstore_local.h"
 
@@ -34,8 +35,6 @@ std::atomic<int> mxnet::kvstore::KVStoreDist::customer_id_{0};
 #if MXNET_USE_NCCL
 #include "./kvstore_nccl.h"
 #endif  // MXNET_USE_NCCL
-
-#include <cstdlib>
 
 namespace mxnet {
 

@@ -2776,16 +2776,22 @@ int MXKVStoreCreate(const char *type,
 }
 
 int MXKVStoreSetGradientCompression(KVStoreHandle handle, uint32_t num_params,
-                                    const char** keys, const char** vals) {
+                                    const char **keys, const char **vals) {
   API_BEGIN();
-  std::vector<std::pair<std::string, std::string> > params;
+  const char *name_cstr;
+  std::vector<std::pair<std::string, std::string>> params;
   for (uint32_t i = 0; i < num_params; ++i) {
+    if (strcmp(keys[i], "name") == 0) {
+      name_cstr = vals[i];
+      continue;
+    }
     std::pair<std::string, std::string> p;
     p.first = keys[i];
     p.second = vals[i];
     params.push_back(p);
   }
-  static_cast<KVStore*>(handle)->SetGradientCompression(params);
+  std::string name = name_cstr;
+  static_cast<KVStore *>(handle)->SetGradientCompression(name, params);
   API_END();
 }
 

@@ -31,7 +31,7 @@
 #include <string>
 #include <functional>
 #include <atomic>
-#include "../../src/kvstore/gradient_compression.h"
+#include "../../src/kvstore/compressor/compressor.h"
 #include "./ndarray.h"
 #if MXNET_USE_DIST_KVSTORE
 #include "ps/ps.h"
@@ -83,8 +83,8 @@ class KVStore {
    * \param compression_type type of compression
    * \param threshold threshold for 2bit compression
    */
-  virtual void SetGradientCompression(const std::vector<std::pair<std::string, std::string> >
-                                      & kwargs) = 0;
+  virtual void SetGradientCompression(const std::string& name,
+                                      const kvstore::compressor::kwarg_t& kwargs) = 0;
 
   /*!
    * \brief Initialize a list of key-value pair to the store.
@@ -485,7 +485,7 @@ class KVStore {
    * Used if SetGradientCompression sets the type.
    * Currently there is no support for un-setting gradient compression
    */
-  std::shared_ptr<kvstore::GradientCompression> gradient_compression_;
+  std::shared_ptr<kvstore::compressor::Compressor> compr_;
 
   /**
    * \brief whether to do barrier when finalize
