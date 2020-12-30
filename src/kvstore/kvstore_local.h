@@ -218,9 +218,9 @@ class KVStoreLocal : public KVStore {
     PullRowSparseImpl(keys, val_rowids, priority);
   }
 
-  void SetGradientCompression(const std::vector<std::pair<std::string, std::string> >
-                              & kwargs) override {
-    gradient_compression_->SetParams(kwargs);
+  void SetGradientCompression(const std::string& name,
+                              const mxnet::kvstore::compressor::kwarg_t& kwargs) override {
+    gradient_compression_->Init(name, kwargs);
   }
 
  private:

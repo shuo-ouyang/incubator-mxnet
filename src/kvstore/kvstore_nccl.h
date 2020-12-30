@@ -180,8 +180,8 @@ class KVStoreNCCL : public KVStoreLocal {
     LOG(FATAL) << "NCCL kvstore does not support sparse storage type";
   }
 
-  void SetGradientCompression(const std::vector<std::pair<std::string, std::string> >
-                                      & kwargs) override {
+  void SetGradientCompression(const std::string& name,
+                              const mxnet::kvstore::compressor::kwarg_t& kwargs) override {
     LOG(FATAL) << "NCCL kvstore does not support gradient compression";
   }
 

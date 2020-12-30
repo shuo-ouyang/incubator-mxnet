@@ -26,151 +26,125 @@
 #include <vector>
 #include "kvstore_local.h"
 #include "gradient_compression.h"
-#include "gradient_compression-inl.h"
 
 namespace mxnet {
 namespace kvstore {
 
-DMLC_REGISTER_PARAMETER(GradientCompressionParam);
+GradientCompression::~GradientCompression() { compr_.release(); }
 
-GradientCompression::GradientCompression() {
-  type_ = CompressionType::kNone;
-}
-
-void GradientCompression::SetParams(const std::vector<std::pair<std::string, std::string> >
-                                    & kwargs) {
-  GradientCompressionParam params;
-  params.InitAllowUnknown(kwargs);
-  CHECK_GT(params.threshold, 0) << "threshold must be greater than 0";
-  if (params.type == "2bit") {
-    SetTwoBitCompression(params.threshold);
-  } else {
-    LOG(FATAL) << "Unknown type for gradient compression " << params.type;
+void GradientCompression::Init(const std::string &name,
+                               const mxnet::kvstore::compressor::kwarg_t &kwargs) {
+  if (this->IsInitialized()) {
+    LOG(WARNING) << "The compressor has been initialized with name " << compr_->TypeString();
+    return;
   }
+  compr_.reset(mxnet::kvstore::compressor::Compressor::Create(name.c_str()));
+  compr_->Init(kwargs);
+  this->init_ = true;
 }
 
-CompressionType GradientCompression::get_type() {
-  return type_;
-}
-
-std::string GradientCompression::get_type_str() {
-  return std::to_string(static_cast<int>(type_));
-}
-
-void GradientCompression::SetTwoBitCompression(const float threshold) {
-  type_ = CompressionType::kTwoBit;
-  threshold_ = threshold;
-}
+std::string GradientCompression::get_type_str() { return compr_->TypeString(); }
 
 std::string GradientCompression::EncodeParams() {
-  using namespace std;  // to reduce length of next line
-  string rval = get_type_str();
-  if (type_ == CompressionType::kTwoBit) {
-    rval += "," + to_string(threshold_);
+  std::string rval = get_type_str();
+  auto params = compr_->GetParams();
+  for (const auto &kv : params) {
+    rval.push_back(',');
+    rval += kv.first;
+    rval.push_back(',');
+    rval += kv.second;
   }
   return rval;
 }
 
-void GradientCompression::DecodeParams(const std::string &s) {
+std::pair<std::string, kvstore::compressor::kwarg_t> GradientCompression::DecodeParams(
+    const std::string &s) {
   std::vector<std::string> elems;
   mxnet::kvstore::split(s, ',', std::back_inserter(elems));
-  type_ = static_cast<CompressionType>(stoi(elems[0]));
-  if (elems.size() > 1) {
-    if (!elems[1].empty()) {
-      threshold_ = stof(elems[1]);
-    }
+  std::string name = elems[0];
+  mxnet::kvstore::compressor::kwarg_t params;
+  for (size_t i = 1; i < elems.size(); i += 2) {
+    params.emplace_back(elems[i], elems[i + 1]);
   }
+  return {name, params};
 }
 
-int GradientCompression::GetCompressionFactor() {
-  if (type_ == CompressionType::kTwoBit) {
-    return 16;
-  } else {
-    LOG(FATAL) << "Unsupported compression type: " << get_type_str();
-    return 0;
-  }
+int GradientCompression::GetCompressionFactor() { return compr_->GetCompressFactor(); }
+
+int64_t GradientCompression::GetCompressedSize(const int64_t &original_size) {
+  return compr_->GetCompressedSize(original_size);
 }
 
-int64_t GradientCompression::GetCompressedSize(const int64_t original_size) {
-  const int bits = GetCompressionFactor();
-  return ((original_size % bits == 0) ?
-          original_size / bits :
-          original_size / bits + 1);
-}
-
-void GradientCompression::Quantize(const mxnet::NDArray &from, mxnet::NDArray *to,
-                  mxnet::NDArray *residual, const int priority) {
+void GradientCompression::CompressEx(const mxnet::NDArray &from, mxnet::NDArray *to,
+                                     mxnet::NDArray *residual, const int priority) {
   CHECK(shape_is_known(from.shape())) << "source operand has undefined shape";
   CHECK(shape_is_known(to->shape())) << "destination operand has undefined shape";
   CHECK(shape_is_known(residual->shape())) << "residual operand has undefined shape";
   const int a = from.ctx().dev_mask();
   const int b = to->ctx().dev_mask();
-  const float threshold = threshold_;
-  if (type_ == CompressionType::kTwoBit) {
-    if (a == mshadow::cpu::kDevMask && b == mshadow::cpu::kDevMask) {
-      mxnet::Engine::Get()->PushSync([from, to, residual, threshold](mxnet::RunContext ctx) {
-        std::vector<mxnet::TBlob> inputs = {from.data(), residual->data(), to->data()};
-        Quantize2BitImpl(ctx.get_stream<mshadow::cpu>(), inputs, threshold);
-      }, from.ctx(), {from.var()}, {to->var(), residual->var()},
-      mxnet::FnProperty::kNormal, priority, "QuantizeCPU");
-    } else {
+
+  if (a == mshadow::cpu::kDevMask and b == mshadow::cpu::kDevMask) {
+    mxnet::Engine::Get()->PushSync(
+        [this, from, to, residual](mxnet::RunContext rctx) {
+          compr_->Compress(rctx, from.data(), const_cast<mxnet::TBlob &>(to->data()),
+                           const_cast<mxnet::TBlob &>(residual->data()));
+        },
+        from.ctx(), {from.var()}, {to->var(), residual->var()}, mxnet::FnProperty::kNormal,
+        priority, "CompressCPU");
+  } else {
 #if MXNET_USE_CUDA
-      if (a == mshadow::gpu::kDevMask && b == mshadow::gpu::kDevMask) {
-        mxnet::Engine::Get()->PushSync([from, to, residual, threshold](mxnet::RunContext ctx) {
-          std::vector<mxnet::TBlob> inputs = {from.data(), residual->data(), to->data()};
-          Quantize2BitImpl(ctx.get_stream<mshadow::gpu>(), inputs, threshold);
-          // Wait GPU kernel to complete
-          ctx.get_stream<mshadow::gpu>()->Wait();
-        }, from.ctx(), {from.var()}, {to->var(), residual->var()},
-        mxnet::FnProperty::kNormal, priority, "QuantizeGPU");
-      } else {
-        LOG(FATAL) << "unknown device mask";
-      }
+    if (a == mshadow::gpu::kDevMask and b == mshadow::gpu::kDevMask) {
+      mxnet::Engine::Get()->PushSync(
+          [this, from, to, residual](mxnet::RunContext rctx) {
+            compr_->Compress(rctx, from.data(), const_cast<mxnet::TBlob &>(to->data()),
+                             const_cast<mxnet::TBlob &>(residual->data()));
+            // Wait GPU kernel to complete
+            rctx.get_stream<mshadow::gpu>()->Wait();
+          },
+          from.ctx(), {from.var()}, {to->var(), residual->var()}, mxnet::FnProperty::kNormal,
+          priority, "CompressGPU");
+    } else {
+      LOG(FATAL) << "unknown device mask";
+    }
 #else
     LOG(FATAL) << MXNET_GPU_NOT_ENABLED_ERROR;
 #endif
-    }
-  } else {
-    LOG(FATAL) << "Unsupported quantization of type " << get_type_str();
   }
 }
 
-void GradientCompression::Dequantize(const mxnet::NDArray &from, mxnet::NDArray *to,
-                                     const int priority) {
+void GradientCompression::DecompressEx(const mxnet::NDArray &from, mxnet::NDArray *to,
+                                       const int priority) {
   CHECK(shape_is_known(from.shape())) << "source operand has undefined shape";
   CHECK(shape_is_known(to->shape())) << "destination operand has undefined shape";
   const int a = from.ctx().dev_mask();
   const int b = to->ctx().dev_mask();
-  const float threshold = threshold_;
-  if (type_ == CompressionType::kTwoBit) {
-    if (a == mshadow::cpu::kDevMask && b == mshadow::cpu::kDevMask) {
-      mxnet::Engine::Get()->PushSync([from, to, threshold](mxnet::RunContext ctx) {
-        std::vector<mxnet::TBlob> inputs = {from.data(), to->data()};
-        Dequantize2BitImpl(ctx.get_stream<mshadow::cpu>(), inputs, threshold);
-      }, from.ctx(), {from.var()}, {to->var()},
-      mxnet::FnProperty::kNormal, priority, "DequantizeCPU");
-    } else {
-#if MXNET_USE_CUDA
-      if (a == mshadow::gpu::kDevMask && b == mshadow::gpu::kDevMask) {
-        mxnet::Engine::Get()->PushSync([from, to, threshold](mxnet::RunContext ctx) {
-          std::vector<mxnet::TBlob> inputs = {from.data(), to->data()};
-          Dequantize2BitImpl(ctx.get_stream<mshadow::gpu>(), inputs, threshold);
-          // Wait GPU kernel to complete
-          ctx.get_stream<mshadow::gpu>()->Wait();
-        }, from.ctx(), {from.var()}, {to->var()},
-        mxnet::FnProperty::kNormal, priority, "DequantizeGPU");
-      } else {
-        LOG(FATAL) << "unknown device mask";
-      }
-#else
-      LOG(FATAL) << MXNET_GPU_NOT_ENABLED_ERROR;
-#endif
-    }
+  if (a == mshadow::cpu::kDevMask and b == mshadow::cpu::kDevMask) {
+    mxnet::Engine::Get()->PushSync(
+        [this, from, to](mxnet::RunContext rctx) {
+          compr_->Decompress(rctx, from.data(), const_cast<mxnet::TBlob &>(to->data()));
+        },
+        from.ctx(), {from.var()}, {to->var()}, mxnet::FnProperty::kNormal, priority,
+        "DecompressCPU");
   } else {
-    LOG(FATAL) << "Unsupported dequantization of type " << get_type_str();
+#if MXNET_USE_CUDA
+    if (a == mshadow::gpu::kDevMask and b == mshadow::gpu::kDevMask) {
+      mxnet::Engine::Get()->PushSync(
+          [this, from, to](mxnet::RunContext rctx) {
+            std::vector<mxnet::TBlob> inputs = {from.data(), to->data()};
+            compr_->Decompress(rctx, from.data(), const_cast<mxnet::TBlob &>(to->data()));
+            // Wait GPU kernel to complete
+            rctx.get_stream<mshadow::gpu>()->Wait();
+          },
+          from.ctx(), {from.var()}, {to->var()}, mxnet::FnProperty::kNormal, priority,
+          "DecompressGPU");
+    } else {
+      LOG(FATAL) << "unknown device mask";
+    }
+#else
+    LOG(FATAL) << MXNET_GPU_NOT_ENABLED_ERROR;
+#endif
   }
 }
 
 }  // namespace kvstore
 }  // namespace mxnet
-

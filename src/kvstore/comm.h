@@ -505,7 +505,7 @@ class CommDevice : public Comm {
                         int priority) override {
     // when this reduce is called from kvstore_dist, gc is not set
     // we don't do compression twice in dist_sync_device
-    if ((gc_ != nullptr) && (gc_->get_type() != CompressionType::kNone)) {
+    if ((gc_ != nullptr) && (gc_->IsInitialized())) {
       return ReduceCompressed(key, src, priority);
     }
 
@@ -588,7 +588,7 @@ class CommDevice : public Comm {
       // compress before copy
       // this is done even if the data is on same context as copy_buf because
       // we don't want the training to be biased towards data on this GPU
-      gc_->Quantize(src[i], &(buf.compressed_send_buf[i]), &(buf.residual[i]), priority);
+      gc_->CompressEx(src[i], &(buf.compressed_send_buf[i]), &(buf.residual[i]), priority);
 
       if (buf.compressed_send_buf[i].ctx() != buf.compressed_recv_buf[i].ctx()) {
         CopyFromTo(buf.compressed_send_buf[i], &(buf.compressed_recv_buf[i]), priority);
@@ -597,7 +597,7 @@ class CommDevice : public Comm {
         buf.compressed_recv_buf[i] = buf.compressed_send_buf[i];
       }
 
-      gc_->Dequantize(buf.compressed_recv_buf[i], &(buf.copy_buf[i]), priority);
+      gc_->DecompressEx(buf.compressed_recv_buf[i], &(buf.copy_buf[i]), priority);
       reduce[i] = buf.copy_buf[i];
     }
     ElementwiseSum(reduce, &buf.merged);

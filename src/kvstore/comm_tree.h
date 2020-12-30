@@ -180,7 +180,7 @@ class CommDeviceTree : public CommDevice {
                         int priority) override {
     // when this reduce is called from kvstore_dist, gc is not set
     // we don't do compression twice in dist_sync_device
-    if ((gc_ != nullptr) && (gc_->get_type() != CompressionType::kNone)) {
+    if ((gc_ != nullptr) && (gc_->IsInitialized())) {
       return ReduceCompressed(key, src, priority);
     }
 
