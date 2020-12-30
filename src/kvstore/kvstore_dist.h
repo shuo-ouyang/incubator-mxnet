@@ -57,6 +57,8 @@ class KVStoreDist : public KVStoreLocal {
     }
     bigarray_bound_ = dmlc::GetEnv("MXNET_KVSTORE_BIGARRAY_BOUND", 1000 * 1000);
     log_verbose_ = dmlc::GetEnv("MXNET_KVSTORE_DIST_ROW_SPARSE_VERBOSE", false);
+    layer_wise_compression_ = dmlc::GetEnv("MXNET_KVSTORE_ENABLE_LAYER_WISE_COMPRESSION", false);
+    compression_bound_ = dmlc::GetEnv("MXNET_KVSTORE_COMPRESSION_BOUND", 8 * 1000);
   }
 
   virtual ~KVStoreDist() {
@@ -84,9 +86,9 @@ class KVStoreDist : public KVStoreLocal {
     }
   }
 
-  void SetGradientCompression(const std::vector<std::pair<std::string, std::string> >
-                              & kwargs) override {
-    KVStoreLocal::SetGradientCompression(kwargs);
+  void SetGradientCompression(const std::string& name,
+                              const mxnet::kvstore::compressor::kwarg_t& kwargs) override {
+    KVStoreLocal::SetGradientCompression(name, kwargs);
     if (get_rank() == 0) {
       SendCommandToServers(static_cast<int>(CommandType::kSetGradientCompression),
                            gradient_compression_->EncodeParams());
@@ -251,8 +253,7 @@ class KVStoreDist : public KVStoreLocal {
         CopyFromTo(merged, &comm_buf);
       }
 
-      CHECK(gradient_compression_->get_type() == CompressionType::kNone)
-               << "Compression not supported with PushPull";
+      CHECK(!gradient_compression_->IsInitialized()) << "Compression not supported with PushPull";
       auto pushpull = [this, key, comm_buf](
           RunContext rctx, Engine::CallbackOnComplete cb) {
         size_t size = comm_buf.shape().Size();
@@ -314,15 +315,16 @@ class KVStoreDist : public KVStoreLocal {
         size_t size = recv_buf.shape().Size();
         const int dtype = recv_buf.dtype();
         const int num_bytes = mshadow::mshadow_sizeof(dtype);
-        PSKV& pskv = (gradient_compression_->get_type() == CompressionType::kNone) ?
-                      EncodeDefaultKey(key, size, num_bytes) :
-                      EncodeCompressedKey(key, size, false, num_bytes);
+        PSKV& pskv = (!gradient_compression_->IsInitialized())
+                         ? EncodeDefaultKey(key, size, num_bytes)
+                         : EncodeCompressedKey(key, size, false, num_bytes);
         char* data = static_cast<char*> (recv_buf.data().dptr_);
         // false means not to delete data when SArray is deleted
         auto vals = new ps::SArray<char>(data, size * num_bytes, false);
         // issue pull
-        RequestType mode = (gradient_compression_->get_type() != CompressionType::kNone) ?
-                  RequestType::kCompressedPushPull : RequestType::kDefaultPushPull;
+        RequestType mode = (gradient_compression_->IsInitialized())
+                               ? RequestType::kCompressedPushPull
+                               : RequestType::kDefaultPushPull;
         const int cmd = GetCommandType(mode, dtype);
         CHECK_NOTNULL(ps_worker_)->ZPull(
           pskv.keys, vals, &pskv.lens, cmd, [vals, cb](){ delete vals; cb(); });
@@ -418,7 +420,8 @@ class KVStoreDist : public KVStoreLocal {
       const int num_bytes = mshadow::mshadow_sizeof(dtype);
       // push to servers
       if (storage_type == kDefaultStorage) {
-        if (gradient_compression_->get_type() == CompressionType::kNone) {
+        if (!gradient_compression_->IsInitialized() or
+            (layer_wise_compression_ and comm_buf.shape().Size() < compression_bound_)) {
           PSKV& pskv = EncodeDefaultKey(key, comm_buf.shape().Size(), num_bytes);
           PushDefault(key, comm_buf, pskv, priority);
         } else {
@@ -439,8 +442,8 @@ class KVStoreDist : public KVStoreLocal {
           }
         }
       } else if (storage_type == kRowSparseStorage) {
-        CHECK(gradient_compression_->get_type() == CompressionType::kNone)
-          << "Gradient compression for row sparse storage type is not supported";
+        CHECK(!gradient_compression_->IsInitialized())
+            << "Gradient compression for row sparse storage type is not supported";
         PushRowSparse(key, comm_buf, priority);
       } else {
         LOG(FATAL) << "unknown storage type";
@@ -461,7 +464,7 @@ class KVStoreDist : public KVStoreLocal {
                         comm_buf.ctx(), false, dtype);
       res_buf = 0;
     }
-    gradient_compression_->Quantize(comm_buf, &small_buf, &res_buf, priority);
+    gradient_compression_->CompressEx(comm_buf, &small_buf, &res_buf, priority);
     auto push_to_servers =
       [this, key, dtype, pskv, small_buf](RunContext rctx, Engine::CallbackOnComplete cb) {
         size_t size = small_buf.shape().Size() * mshadow::mshadow_sizeof(dtype);
@@ -670,7 +673,7 @@ class KVStoreDist : public KVStoreLocal {
     mu_.unlock();
 
     if (!pskv.keys.empty()) {
-      const size_t num_elem = (is_push) ? compr_num_elem : original_num_elem;
+      const size_t num_elem = is_push ? compr_num_elem : original_num_elem;
       CHECK_EQ(static_cast<size_t >(pskv.size), num_elem * num_bytes)
         << "The value size can't be changed. For key " << key;
     } else {
@@ -694,12 +697,12 @@ class KVStoreDist : public KVStoreLocal {
         // data
         push_pskv.keys.push_back(ps_key);
         pull_pskv.keys.push_back(ps_key);
-        const int compr_size = compr_num_elem * num_bytes;
-        const int original_size = original_num_elem * num_bytes;
-        push_pskv.lens.push_back(compr_size);
-        pull_pskv.lens.push_back(original_size);
-        push_pskv.size = compr_size;
-        pull_pskv.size = original_size;
+        const int push_size = compr_num_elem * num_bytes;
+        const int pull_size = original_num_elem * num_bytes;
+        push_pskv.lens.push_back(push_size);
+        pull_pskv.lens.push_back(pull_size);
+        push_pskv.size = push_size;
+        pull_pskv.size = pull_size;
       } else {
         // partition it to all servers
         push_pskv.size = 0;
@@ -740,8 +743,8 @@ class KVStoreDist : public KVStoreLocal {
         push_pskv.size *= num_bytes;
         pull_pskv.size *= num_bytes;
         CHECK_EQ(push_pskv.lens.size(), num_servers * 2);
-        }
       }
+    }
     return pskv;
   }
 
@@ -835,7 +838,14 @@ class KVStoreDist : public KVStoreLocal {
    * during gradient compression
    */
   std::unordered_map<int, NDArray> residual_;
+
+  std::unordered_map<int, NDArray> decomp_buf_;
+  
   bool log_verbose_;
+
+  bool layer_wise_compression_;
+
+  size_t compression_bound_;
 };
 
 }  // namespace kvstore

@@ -18,23 +18,21 @@
  */
 
 /*!
- * \file gradient_compression.cu
- * \author Rahul Huilgol
- * \brief Implementation for gpu version of code
+ * \file twobit.cc
+ * \brief Two bit compressor for kvstore.
+ * \author Shuo Ouyang
  */
 
-#include "gradient_compression-inl.h"
+#include "twobit-inl.h"
 
 namespace mxnet {
 namespace kvstore {
-void Quantize2BitImpl(mshadow::Stream<gpu>* s, const std::vector<TBlob>& inputs,
-                      const float threshold) {
-  Quantize2BitKernelLaunch(s, inputs, threshold);
-}
+namespace compressor {
+DMLC_REGISTER_PARAMETER(TwoBitCompressorParam);
 
-void Dequantize2BitImpl(mshadow::Stream<gpu>* s, const std::vector<TBlob>& inputs,
-                        const float threshold) {
-  Dequantize2BitKernelLaunch(s, inputs, threshold);
-}
+KVSTORE_REGISTER_COMPRESSOR(TwoBitCompressor, TwoBitCompressor)
+    .add_arguments(TwoBitCompressorParam::__FIELDS__());
+
+}  // namespace compressor
 }  // namespace kvstore
 }  // namespace mxnet
