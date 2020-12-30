@@ -452,6 +452,9 @@ class CommDevice : public Comm {
  public:
   CommDevice() {
     inited_ = false;
+    layer_wise_compression_ = dmlc::GetEnv("MXNET_KVSTORE_ENABLE_LAYER_WISE_COMPRESSION", false);
+    compression_bound_ = dmlc::GetEnv("MXNET_KVSTORE_COMPRESSION_BOUND", 8 * 1000);
+    fast_aggregate_ = dmlc::GetEnv("MXNET_KVSTORE_FAST_AGGREGATE", false);
   }
 
   virtual ~CommDevice() { }
@@ -504,8 +507,12 @@ class CommDevice : public Comm {
                         int priority) override {
     // when this reduce is called from kvstore_dist, gc is not set
     // we don't do compression twice in dist_sync_device
-    if ((gc_ != nullptr) && (gc_->get_type() != CompressionType::kNone)) {
-      return ReduceCompressed(key, src, priority);
+    if ((gc_ != nullptr) and gc_->IsInitialized()) {
+      if (!layer_wise_compression_) {
+        return ReduceCompressed(key, src, priority);
+      } else if (src[0].shape().Size() > compression_bound_) {
+        return ReduceCompressed(key, src, priority);
+      }
     }
 
     // avoid extra copy for single device, but it may bring problems for
@@ -579,19 +586,20 @@ class CommDevice : public Comm {
       // compress before copy
       // this is done even if the data is on same context as copy_buf because
       // we don't want the training to be biased towards data on this GPU
-      gc_->Quantize(src[i], &(buf.compressed_send_buf[i]), &(buf.residual[i]), priority);
+      gc_->CompressEx(src[i], &(buf.compressed_send_buf[i]), &(buf.residual[i]), priority);
 
-      if (buf.compressed_send_buf[i].ctx() != buf.compressed_recv_buf[i].ctx()) {
-        CopyFromTo(buf.compressed_send_buf[i], &(buf.compressed_recv_buf[i]), priority);
+      CopyFromTo(buf.compressed_send_buf[i], &(buf.compressed_recv_buf[i]), priority);
+
+      if (fast_aggregate_ and gc_->SupportFastAggregate()) {
+        gc_->DecompressAndAggregateEx(buf.compressed_recv_buf[i], &(buf.merged), priority);
       } else {
-        // avoid memory copy when they are on same context
-        buf.compressed_recv_buf[i] = buf.compressed_send_buf[i];
+        gc_->DecompressEx(buf.compressed_recv_buf[i], &(buf.copy_buf[i]), priority);
+        reduce[i] = buf.copy_buf[i];
       }
-
-      gc_->Dequantize(buf.compressed_recv_buf[i], &(buf.copy_buf[i]), priority);
-      reduce[i] = buf.copy_buf[i];
     }
-    ElementwiseSum(reduce, &buf.merged);
+    if (!gc_->SupportFastAggregate()) {
+      ElementwiseSum(reduce, &buf.merged, priority);
+    }
     return buf.merged;
   }
 
@@ -794,6 +802,9 @@ class CommDevice : public Comm {
  public:
   bool inited_;
   std::vector<KeyAttrs> sorted_key_attrs_;
+  bool layer_wise_compression_;
+  size_t compression_bound_;
+  bool fast_aggregate_;
 };
 
 }  // namespace kvstore

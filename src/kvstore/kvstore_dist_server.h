@@ -164,6 +164,8 @@ class KVStoreDistServer {
     sync_mode_ = false;
     gradient_compression_ = std::make_shared<GradientCompression>();
     log_verbose_ = dmlc::GetEnv("MXNET_KVSTORE_DIST_ROW_SPARSE_VERBOSE", false);
+    fast_aggregate_ = dmlc::GetEnv("MXNET_KVSTORE_FAST_AGGREGATE", false);
+    compressed_pull_ = dmlc::GetEnv("MXNET_KVSTORE_COMPRESSED_PULL", false);
   }
 
   ~KVStoreDistServer() {
@@ -206,7 +208,7 @@ class KVStoreDistServer {
         sync_mode_ = true;
         break;
       case CommandType::kSetGradientCompression:
-        gradient_compression_->DecodeParams(recved.body);
+        CreateCompressorOnServer(recved.body);
         break;
       case CommandType::kSetProfilerParams:
         // last char is the type of profiler command
@@ -271,6 +273,11 @@ class KVStoreDistServer {
     for (auto const &stored_realt_entry : store_realt_) {
       stored_realt_entry.second.WaitToRead();
     }
+  }
+
+  void CreateCompressorOnServer(const std::string& body) {
+    auto p = gradient_compression_->DecodeParams(body);
+    gradient_compression_->Init(p.first, p.second);
   }
 
   void ProcessServerProfilerCommands(KVStoreServerProfilerCommand type, const std::string& body) {
@@ -622,6 +629,31 @@ class KVStoreDistServer {
     server->Response(req_meta, response);
   }
 
+  void CompressedResponse(const DataHandleType type, const int key, const ps::KVMeta& req_meta,
+                          const ps::KVPairs<char>& req_data, ps::KVServer<char>* server) {
+    ps::KVPairs<char> response;
+    const NDArray& stored = store_[key];
+    CHECK(!stored.is_none()) << "init " << key << " first";
+    NDArray& compr_buf = compr_buf_[key];
+    int64_t compr_size = gradient_compression_->GetCompressedSize(stored.shape().Size());
+    mxnet::TShape dshape = mxnet::TShape{(int64_t)compr_size};
+    if (compr_buf.is_none()) {
+      compr_buf = NDArray(dshape, Context(), false, stored.dtype());
+    }
+    NDArray& residual = residual_[key];
+    if (residual.is_none()) {
+      residual = NDArray(stored.shape(), Context(), false, stored.dtype());
+    }
+    gradient_compression_->CompressEx(stored, &compr_buf, &residual, 0);
+
+    auto num_bytes = mshadow::mshadow_sizeof(stored.dtype());
+    auto len = compr_size * num_bytes;
+    response.keys = req_data.keys;
+    response.lens = {len};
+    response.vals.CopyFrom(static_cast<const char*>(compr_buf.data().dptr_), len);
+    server->Response(req_meta, response);
+  }
+
   void DataHandleCompressed(const DataHandleType type,
                             const ps::KVMeta& req_meta,
                             const ps::KVPairs<char> &req_data,
@@ -647,47 +679,52 @@ class KVStoreDistServer {
       TBlob recv_blob(reinterpret_cast<real_t*>(req_data.vals.data()), dshape, cpu::kDevMask);
       NDArray recved = NDArray(recv_blob, 0);
 
-      NDArray decomp_buf = decomp_buf_[key];
-      dshape = mxnet::TShape{(int64_t) original_size};
-
-      if (decomp_buf.is_none()) {
-        decomp_buf = NDArray(dshape, Context());
-      }
+      dshape = mxnet::TShape{(int64_t)original_size};
 
       if (stored.is_none()) {
         stored = NDArray(dshape, Context());
-        gradient_compression_->Dequantize(recved, &stored, 0);
+        gradient_compression_->DecompressEx(recved, &stored, 0);
         server->Response(req_meta);
         stored.WaitToRead();
-      } else if (sync_mode_) {
-        // synced push
-        auto& merged = update_buf_[key];
-        if (merged.merged.is_none()) {
-          merged.merged = NDArray(dshape, Context());
-        }
-        if (merged.request.size() == 0) {
-          gradient_compression_->Dequantize(recved, &merged.merged, 0);
-        } else {
-          gradient_compression_->Dequantize(recved, &decomp_buf, 0);
-          merged.merged += decomp_buf;
-        }
-        merged.request.push_back(req_meta);
-        ApplyUpdates(type, key, req_data, &merged, server);
       } else {
-        // async push
-        gradient_compression_->Dequantize(recved, &decomp_buf, 0);
-        exec_.Exec([this, key, &decomp_buf, &stored]() {
-          CHECK(updater_);
-          updater_(key, decomp_buf, &stored);
-        });
-        server->Response(req_meta);
-        stored.WaitToRead();
+        auto& updates = update_buf_[key];
+
+        if (sync_mode_) {
+          NDArray& decomp_buf = decomp_buf_[key];
+          if (updates.merged.is_none()) {
+            updates.merged = NDArray(dshape, Context());
+            updates.merged = 0;
+          }
+
+          if (decomp_buf.is_none()) {
+            decomp_buf = NDArray(dshape, Context());
+          }
+
+          if (updates.request.empty()) {
+            gradient_compression_->DecompressEx(recved, &(updates.merged), 0);
+          } else {
+            gradient_compression_->DecompressEx(recved, &decomp_buf, 0);
+            updates.merged += decomp_buf;
+          }
+
+        } else {  // async push
+          if (updates.temp_array.is_none()) {
+            updates.temp_array = NDArray(dshape, Context());
+          }
+          gradient_compression_->DecompressEx(recved, &(updates.temp_array), 0);
+        }
+        updates.request.push_back(req_meta);
+        ApplyUpdates(type, key, req_data, &updates, server);
       }
-    } else {       // pull
+    } else {  // pull
       CHECK_EQ(req_data.keys.size(), (size_t)1);
       CHECK_EQ(req_data.lens.size(), (size_t)0);
       int key = DecodeKey(req_data.keys[0]);
-      DefaultStorageResponse(type, key, req_meta, req_data, server);
+      if (sync_mode_ and compressed_pull_) {
+        CompressedResponse(type, key, req_meta, req_data, server);
+      } else {
+        DefaultStorageResponse(type, key, req_meta, req_data, server);
+      }
     }
   }
 
@@ -794,6 +831,10 @@ class KVStoreDistServer {
    */
   std::unordered_map<int, NDArray> decomp_buf_;
 
+  std::unordered_map<int, NDArray> compr_buf_;
+
+  std::unordered_map<int, NDArray> residual_;
+
   Executor exec_;
   ps::KVServer<char>* ps_server_;
 
@@ -813,6 +854,10 @@ class KVStoreDistServer {
    * currently there is no support for unsetting gradient compression
    */
   std::shared_ptr<kvstore::GradientCompression> gradient_compression_;
+
+  bool fast_aggregate_;
+
+  bool compressed_pull_;
 };
 
 }  // namespace kvstore
