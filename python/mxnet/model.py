@@ -147,6 +147,33 @@ def _update_params_on_kvstore_nccl(param_arrays, grad_arrays, kvstore, param_nam
         kvstore.pull(valid_param_names[start:end], valid_param_arrays[start:end], priority=-start)
         start = end
 
+def _update_asymmetric(param_arrays, grad_arrays, counter, updater, num_device, kvstore, param_names):
+    updates = [[] for _ in range(num_device)]
+    local_update = (counter % 32 != 0)
+    for i, pair in enumerate(zip(param_arrays, grad_arrays)):
+        arg_list, grad_list = pair
+        if grad_list[0] is None:
+            continue
+        name = param_names[i]
+        if kvstore:
+            kvstore.push(name, grad_list, priority=-i)
+            if local_update:
+                for k, p in enumerate(zip(arg_list, grad_list)):
+                    w, g = p
+                    updates[k].append((i*num_device+k, g, w))
+            else:
+                arg_pull = [nd.zeros_like(arg) for arg in arg_list]
+                kvstore.pull(name, arg_pull, priority=-i)
+                for j, args in enumerate(zip(arg_list, arg_pull)):
+                    arg1, arg2 = args
+                    arg1 = .5 * arg1 + .5 * arg2
+    if local_update:
+        for dev_updates in updates:
+            if dev_updates:
+                i, w, g = zip(*dev_updates)
+                updater(i, w, g)
+
+
 def _update_params_on_kvstore(param_arrays, grad_arrays, kvstore, param_names):
     """Perform update of param_arrays from grad_arrays on kvstore."""
     for index, pair in enumerate(zip(param_arrays, grad_arrays)):
